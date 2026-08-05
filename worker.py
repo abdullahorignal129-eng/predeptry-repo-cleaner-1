@@ -1,10 +1,4 @@
 # worker.py
-"""
-Dumb GitHub Worker. 
-1. Asks HF Space for 15k repo_ids
-2. Scrapes them concurrently
-3. Posts results back to HF Space
-"""
 import os
 import asyncio
 import aiohttp
@@ -15,6 +9,23 @@ from typing import List, Dict, Any
 API = "https://api.github.com"
 PER_TOKEN_CONCURRENCY = 3
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "http://localhost:7860")
+
+# Directories to completely ignore when counting files
+EXCLUDED_DIRS = {".github", ".venv", "node_modules", "dist", "build", "target", "__pycache__", ".idea", ".vscode", "venv", "env"}
+# File extensions to ignore (compiled/built artifacts)
+EXCLUDED_EXTS = {".pyc", ".pyo", ".so", ".dll", ".exe", ".class", ".o", ".obj", ".jar", ".war"}
+
+def is_excluded(path: str) -> bool:
+    """Check if a file path falls into excluded directories or extensions."""
+    parts = path.lower().split("/")
+    for part in parts[:-1]:
+        if part in EXCLUDED_DIRS:
+            return True
+    if "." in parts[-1]:
+        ext = "." + parts[-1].rsplit(".", 1)[-1]
+        if ext in EXCLUDED_EXTS:
+            return True
+    return False
 
 def load_tokens() -> list[str]:
     multi = os.environ.get("GITHUB_TOKENS", "").strip()
@@ -66,9 +77,6 @@ class RateLimiter:
                 pass
         return False
 
-    def is_exhausted(self) -> bool:
-        return self._reset_at > asyncio.get_event_loop().time()
-
 async def http_get(session, limiter, sem, url, max_retries=8):
     for attempt in range(max_retries):
         await limiter.wait_if_needed()
@@ -103,6 +111,29 @@ async def fetch_langs(session, limiter, sem, rid: int) -> dict:
     try: return json.loads(body) or {}
     except: return {}
 
+async def fetch_and_count_files(session, limiter, sem, full_name: str, branch: str) -> int | None:
+    """Fetches the Git Tree and counts valid files, ignoring built/junk folders."""
+    if not full_name or not branch:
+        return None
+        
+    status, body = await http_get(session, limiter, sem, f"{API}/repos/{full_name}/git/trees/{branch}?recursive=1")
+    if status != 200 or body is None:
+        return None
+        
+    try:
+        tree_data = json.loads(body)
+        # If the tree is truncated by GitHub, it has > 100,000 files. We can just return a huge number.
+        if tree_data.get("truncated"):
+            return 999999 
+            
+        count = 0
+        for item in tree_data.get("tree", []):
+            if item.get("type") == "blob" and not is_excluded(item.get("path", "")):
+                count += 1
+        return count
+    except:
+        return None
+
 def usable_canonical(j: dict, allow_archived: bool) -> tuple[bool, str]:
     if j.get("fork"): return False, "still_fork"
     if j.get("disabled"): return False, "disabled"
@@ -121,10 +152,6 @@ def upstream_ids(fork_j: dict) -> list[int]:
     return out
 
 async def process_repo_id(rid, session, limiter, sem, results: Dict[str, list], allow_archived: bool):
-    # We don't have file_count_part in the worker anymore since HF Space owns DB.
-    # We'll set it to None or fetch it if needed. For now, we omit it.
-    part = {"file_count_part": 0, "bytes_part": 0} 
-
     st, j = await fetch_repo(session, limiter, sem, rid)
     if st != "ok" or not j:
         results["errors"].append({"repo_id": rid, "error": st})
@@ -133,9 +160,15 @@ async def process_repo_id(rid, session, limiter, sem, results: Dict[str, list], 
     if not j.get("fork"):
         ok, reason = usable_canonical(j, allow_archived)
         if not ok:
-            results["errors"].append({"repo_id": rid, "error": reason}) # Treat skip as error/done for queue
+            results["errors"].append({"repo_id": rid, "error": reason})
             return
         
+        # Fetch file count (does NOT filter, just records the number)
+        file_count = await fetch_and_count_files(session, limiter, sem, j.get("full_name"), j.get("default_branch"))
+        if file_count is None:
+            results["errors"].append({"repo_id": rid, "error": "tree_fetch_failed"})
+            return
+
         langs = await fetch_langs(session, limiter, sem, rid)
         total = sum(langs.values()) if langs else 0
         py = langs.get("Python", 0) if langs else 0
@@ -159,8 +192,7 @@ async def process_repo_id(rid, session, limiter, sem, results: Dict[str, list], 
             "python_bytes": py,
             "total_lang_bytes": total,
             "python_pct": round(python_pct(langs), 2),
-            "file_count_part": part["file_count_part"],
-            "bytes_part": part["bytes_part"],
+            "file_count": file_count, # Saved to DB for later filtering
             "resolved_from_fork_id": None
         })
         return
@@ -193,6 +225,12 @@ async def process_repo_id(rid, session, limiter, sem, results: Dict[str, list], 
             rec["resolution"] = f"upstream_{uid}_{reason}"
             continue
             
+        # Fetch file count for upstream repo
+        file_count = await fetch_and_count_files(session, limiter, sem, uj.get("full_name"), uj.get("default_branch"))
+        if file_count is None:
+            rec["resolution"] = f"upstream_{uid}_tree_fetch_failed"
+            continue
+
         langs = await fetch_langs(session, limiter, sem, uid)
         total = sum(langs.values()) if langs else 0
         py = langs.get("Python", 0) if langs else 0
@@ -216,8 +254,7 @@ async def process_repo_id(rid, session, limiter, sem, results: Dict[str, list], 
             "python_bytes": py,
             "total_lang_bytes": total,
             "python_pct": round(python_pct(langs), 2),
-            "file_count_part": part["file_count_part"],
-            "bytes_part": part["bytes_part"],
+            "file_count": file_count,
             "resolved_from_fork_id": rid
         })
         
@@ -268,11 +305,9 @@ async def main():
 
     print(f"Received {len(ids)} jobs. Starting scraping...")
 
-    # Split IDs among tokens
     chunk_size = len(ids) // len(tokens) if tokens else len(ids)
     id_chunks = [ids[i:i + chunk_size] for i in range(0, len(ids), chunk_size)]
 
-    # Shared results dictionary
     results = {"metadata": [], "forks": [], "errors": []}
     
     await asyncio.gather(
