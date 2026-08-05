@@ -1,31 +1,28 @@
-name: github-metadata-worker
+name: Test GraphQL Scraper (3 Tokens)
+
 on:
-  workflow_dispatch: {}
-  # schedule:
-    # - cron: "13 */6 * * *"
-concurrency:
-  group: github-metadata-worker-${{ github.run_id }}
-  cancel-in-progress: false
+  workflow_dispatch: {} # Manual trigger for testing
 
 jobs:
-  run-worker:
+  scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 360 # 1 hour timeout for the test run
     steps:
-      - name: Checkout repo
+      - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          pip install aiohttp requests
-      - name: Run Worker
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install aiohttp
+
+      - name: Run GraphQL Worker
         env:
+          # Pass your 3 test tokens here, comma-separated
           GITHUB_TOKENS: ${{ secrets.GH_TOKENS }}
-          HF_SPACE_URL: ${{ secrets.HF_SPACE_URL }} # e.g. https://your-space-name.hf.space
-        run: |
-          python worker.py --allow-archived
+          # Your HF Space URL
+          HF_SPACE_URL: ${{ secrets.HF_SPACE_URL }}
+        run: python worker.py
