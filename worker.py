@@ -9,7 +9,6 @@ API = "https://api.github.com/graphql"
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "http://localhost:7860")
 
 def load_tokens() -> list[str]:
-    # Expects comma-separated tokens: tok1,tok2,tok3
     multi = os.environ.get("GITHUB_TOKENS", "").strip()
     if multi:
         return [t.strip() for t in multi.split(",") if t.strip()]
@@ -23,17 +22,14 @@ def auth_headers(token: str) -> dict:
     }
 
 def escape_graphql_string(s: str) -> str:
-    """Escapes quotes and backslashes for GraphQL strings."""
     if not s: return ""
     return s.replace("\\", "\\\\").replace("\"", "\\\"")
 
 def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
-    """Builds a GraphQL query with up to 100 aliases."""
     aliases = []
     for i, job in enumerate(jobs):
         path = job.get("repo_path", "")
         if "/" not in path:
-            # Fallback for invalid paths to prevent query syntax errors
             aliases.append(f'repo{i}: repository(owner: "invalid", name: "invalid") {{ nameWithOwner }}')
             continue
             
@@ -41,13 +37,14 @@ def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
         owner_esc = escape_graphql_string(owner)
         name_esc = escape_graphql_string(name)
         
+        # FIXED: issues(states: [OPEN]) instead of issues(states: OPEN)
         aliases.append(f'''
         repo{i}: repository(owner: "{owner_esc}", name: "{name_esc}") {{
             nameWithOwner
             description
             stargazerCount
             forkCount
-            issues(states: OPEN) {{ totalCount }}
+            issues(states: [OPEN]) {{ totalCount }}
             licenseInfo {{ spdxId }}
             isArchived
             createdAt
@@ -122,19 +119,17 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
             elif response.status in [403, 429]:
                 print(f"Token {token[:4]}... rate limited. Sleeping 60s.")
                 await asyncio.sleep(60)
-                # Retry this batch
                 await process_batch(jobs, token, results, session)
             else:
                 err = await response.text()
                 for job in jobs:
-                    results["errors"].append({"repo_id": job["repo_id"], "error": f"http_{response_status}"})
+                    results["errors"].append({"repo_id": job["repo_id"], "error": f"http_{response.status}"})
                     
     except Exception as e:
         for job in jobs:
             results["errors"].append({"repo_id": job["repo_id"], "error": str(e)[:100]})
 
 async def token_worker(token: str, queue: asyncio.Queue, results: Dict[str, list]):
-    # 2 concurrent requests per token
     sem = asyncio.Semaphore(2)
     async with aiohttp.ClientSession() as session:
         while True:
@@ -155,7 +150,6 @@ async def main():
     print(f"Loaded {len(tokens)} tokens. 2 concurrent requests per token active.")
 
     async with aiohttp.ClientSession() as http_session:
-        # Retry loop in case HF Space queue is momentarily empty
         jobs = []
         retries = 0
         while retries < 5:
@@ -184,14 +178,12 @@ async def main():
     for i in range(0, len(jobs), batch_size):
         await queue.put(jobs[i:i + batch_size])
         
-    # Put poison pills for workers to exit
     for _ in tokens:
         await queue.put(None)
 
     results = {"metadata": [], "errors": []}
     workers = [asyncio.create_task(token_worker(t, queue, results)) for t in tokens]
     
-    # Wait for queue to empty
     await queue.join()
     for w in workers:
         w.cancel()
