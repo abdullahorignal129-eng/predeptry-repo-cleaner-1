@@ -1,0 +1,31 @@
+name: github-metadata-worker
+on:
+  workflow_dispatch: {}
+  # schedule:
+    # - cron: "13 */6 * * *"
+concurrency:
+  group: github-metadata-worker-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install aiohttp requests
+      - name: Run Worker
+        env:
+          GITHUB_TOKENS: ${{ secrets.GH_TOKENS }}
+          HF_SPACE_URL: ${{ secrets.HF_SPACE_URL }} # e.g. https://your-space-name.hf.space
+        run: |
+          python worker.py --allow-archived
