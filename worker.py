@@ -11,7 +11,6 @@ API = "https://api.github.com/graphql"
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "http://localhost:7860")
 
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 30 * 60)))
-# Increased default concurrency from 3 to 5
 CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "3"))
 BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "100")) 
 
@@ -45,13 +44,13 @@ def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
         owner_esc = escape_graphql_string(owner)
         name_esc = escape_graphql_string(name)
 
+        # REMOVED: issues(states: [OPEN]) { totalCount } to prevent 403 Secondary Rate Limits
         aliases.append(f'''
         repo{i}: repository(owner: "{owner_esc}", name: "{name_esc}") {{
             nameWithOwner
             description
             stargazerCount
             forkCount
-            issues(states: [OPEN]) {{ totalCount }}
             licenseInfo {{ spdxId }}
             isArchived
             createdAt
@@ -86,7 +85,7 @@ def repo_data_to_metadata_row(rid: int, repo_data: dict) -> dict:
         "description": repo_data.get("description"),
         "stars": repo_data.get("stargazerCount"),
         "forks_count": repo_data.get("forkCount"),
-        "open_issues": repo_data.get("issues", {}).get("totalCount", 0),
+        "open_issues": 0,  # Explicitly set to 0 since we no longer query it
         "license": (repo_data.get("licenseInfo") or {}).get("spdxId"),
         "archived": 1 if repo_data.get("isArchived") else 0,
         "created_at": repo_data.get("createdAt"),
@@ -207,11 +206,9 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
 
                 elif response.status in (403, 429):
                     stats.rate_limited += 1
-                    # Read the exact error message from GitHub
                     body = await response.text()
                     print(f"[{token_label}] HTTP {response.status} (Attempt {attempt+1}/{max_retries}): {body[:200]}")
                     
-                    # Check for Retry-After header (Secondary limit)
                     retry_after = response.headers.get("Retry-After")
                     if retry_after:
                         sleep_time = int(retry_after) + 2
@@ -261,8 +258,8 @@ async def token_worker(token: str, token_label: str, queue: asyncio.Queue,
     async def run_one(batch):
         async with sem:
             await process_batch(batch, token, results, github_session, stats, token_label)
-            # Add a 1-second delay after finishing a batch to prevent secondary rate limits
-            await asyncio.sleep(1)
+            # 3-second delay to prevent secondary rate limits
+            await asyncio.sleep(3)
 
     tasks = []
     while True:
@@ -326,10 +323,8 @@ async def main():
     start = time.monotonic()
     round_num = 0
 
-    # Use a shared connection pool for GitHub API to reduce TCP handshake latency
     connector = aiohttp.TCPConnector(limit=100)
     
-    # We use two sessions: one for GitHub (high concurrency) and one for HF Space
     async with aiohttp.ClientSession() as hf_session, aiohttp.ClientSession(connector=connector) as github_session:
         background_uploads = []
         
@@ -348,7 +343,7 @@ async def main():
             print(f"[round {round_num}] received {len(jobs)} jobs")
             results = await run_one_round(tokens, jobs, stats, github_session)
             
-            # PIPELINE OPTIMIZATION: Fire the upload in the background and immediately fetch the next batch!
+            # PIPELINE OPTIMIZATION: Fire the upload in the background
             background_uploads.append(asyncio.create_task(post_work(hf_session, results)))
             
             print(stats.line())
