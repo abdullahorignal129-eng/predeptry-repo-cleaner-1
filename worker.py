@@ -9,8 +9,8 @@ API = "https://api.github.com/graphql"
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "http://localhost:7860")
 
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 30 * 60)))
-CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "2"))
-BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "100"))
+CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "3"))
+BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "200")) 
 
 def load_tokens() -> list[str]:
     multi = os.environ.get("GITHUB_TOKENS", "").strip()
