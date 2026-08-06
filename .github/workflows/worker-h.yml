@@ -1,0 +1,49 @@
+name: Scrape GitHub Repo Metadata - 8
+on:
+  workflow_dispatch:
+    inputs:
+      max_runtime_hours:
+        description: 'Max hours this run should keep pulling batches before exiting cleanly'
+        required: false
+        default: '5.5'
+  schedule:
+    # Native timezone support (added to GitHub Actions in March 2026) — runs at
+    # 00:00, 06:00, 12:00, 18:00 in Asia/Karachi (Pakistan Standard Time, UTC+5,
+    # no DST) without needing manual UTC conversion.
+    - cron: '0 0,6,12,18 * * *'
+      timezone: 'Asia/Karachi'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # hard GH Actions ceiling; keep MAX_RUNTIME_SECONDS below this
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install aiohttp
+
+      - name: Compute runtime budget
+        id: budget
+        run: |
+          HOURS="${{ github.event.inputs.max_runtime_hours }}"
+          HOURS="${HOURS:-5.5}"
+          SECONDS=$(python3 -c "print(int(float('$HOURS') * 3600))")
+          echo "seconds=$SECONDS" >> "$GITHUB_OUTPUT"
+          echo "Runtime budget: $HOURS hours ($SECONDS seconds)"
+
+      - name: Run GraphQL Worker
+        env:
+          GITHUB_TOKENS: ${{ secrets.GH_TOKENS_H }}
+          HF_SPACE_URL: ${{ secrets.HF_SPACE_URL }}
+          CONCURRENCY_PER_TOKEN: "2"
+          GRAPHQL_BATCH_SIZE: "100"
+          MAX_RUNTIME_SECONDS: ${{ steps.budget.outputs.seconds }}
+          PYTHONUNBUFFERED: "1"
+        run: python worker.py
