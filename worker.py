@@ -11,8 +11,12 @@ API = "https://api.github.com/graphql"
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "http://localhost:7860")
 
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 30 * 60)))
-BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "100")) 
-CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "3")) 
+BATCH_SIZE = 100
+CONCURRENCY_PER_TOKEN = 3
+
+# Global semaphore to strictly limit total concurrent requests across all tokens.
+# 3 tokens * 3 concurrent = 9 max requests at a time.
+GLOBAL_SEM = asyncio.Semaphore(CONCURRENCY_PER_TOKEN * 10) 
 
 def ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
@@ -31,8 +35,7 @@ def auth_headers(token: str) -> dict:
     }
 
 def escape_graphql_string(s: str) -> str:
-    if not s:
-        return ""
+    if not s: return ""
     return s.replace("\\", "\\\\").replace("\"", "\\\"")
 
 def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
@@ -47,7 +50,6 @@ def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
         owner_esc = escape_graphql_string(owner)
         name_esc = escape_graphql_string(name)
 
-        # Ultra-lean query: No languages, no issues, no topics.
         aliases.append(f'''
         repo{i}: repository(owner: "{owner_esc}", name: "{name_esc}") {{
             description
@@ -107,8 +109,7 @@ class RunStats:
                 f"exceptions={self.exceptions} rate_limited={self.rate_limited}")
 
 async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[str, list],
-                        session: aiohttp.ClientSession, stats: RunStats, token_label: str,
-                        parent_queue: asyncio.Queue):
+                        session: aiohttp.ClientSession, stats: RunStats, token_label: str):
     if not jobs:
         return
 
@@ -156,14 +157,8 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                                     batch_not_found += 1
                                     continue
                                 
-                                # If it's a fork, DO NOT save the fork. Add parent to queue.
                                 if repo_data.get("isFork") and repo_data.get("parent"):
-                                    parent_id = repo_data["parent"].get("databaseId")
-                                    parent_path = repo_data["parent"].get("nameWithOwner")
-                                    if parent_id and parent_path:
-                                        await parent_queue.put({"repo_id": parent_id, "repo_path": parent_path})
-                                        stats.forks_resolved += 1
-                                    # Mark the fork itself as "done" so we don't re-query it
+                                    stats.forks_resolved += 1
                                     results["errors"].append({"repo_id": rid, "error": "fork_resolved_to_parent"})
                                 else:
                                     results["metadata"].append(repo_data_to_metadata_row(rid, repo_data))
@@ -178,8 +173,6 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                             stats.jobs_error += len(jobs)
                         
                         stats.batches_done += 1
-                        if stats.batches_done % 25 == 0:
-                            print(stats.line())
                         return
 
                     batch_ok = 0
@@ -192,13 +185,8 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                             batch_missing += 1
                             continue
                         
-                        # If it's a fork, DO NOT save the fork. Add parent to queue.
                         if repo_data.get("isFork") and repo_data.get("parent"):
-                            parent_id = repo_data["parent"].get("databaseId")
-                            parent_path = repo_data["parent"].get("nameWithOwner")
-                            if parent_id and parent_path:
-                                await parent_queue.put({"repo_id": parent_id, "repo_path": parent_path})
-                                stats.forks_resolved += 1
+                            stats.forks_resolved += 1
                             results["errors"].append({"repo_id": rid, "error": "fork_resolved_to_parent"})
                         else:
                             results["metadata"].append(repo_data_to_metadata_row(rid, repo_data))
@@ -209,8 +197,6 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                     stats.not_found += batch_missing
 
                     stats.batches_done += 1
-                    if stats.batches_done % 25 == 0:
-                        print(stats.line())
                     return
 
                 elif response.status in (403, 429):
@@ -245,52 +231,6 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
     stats.jobs_error += len(jobs)
     stats.exceptions += 1
 
-async def parent_queue_worker(parent_queue: asyncio.Queue, tokens: List[str], results: Dict[str, list], stats: RunStats, github_session: aiohttp.ClientSession):
-    # Processes parents discovered during the main run
-    sem = asyncio.Semaphore(CONCURRENCY_PER_TOKEN * len(tokens))
-    token_idx = 0
-
-    async def run_one(parent_job):
-        nonlocal token_idx
-        token = tokens[token_idx % len(tokens)]
-        token_idx += 1
-        async with sem:
-            # Query the parent by itself
-            await process_batch([parent_job], token, results, github_session, stats, f"parent_tok", asyncio.Queue())
-
-    tasks = []
-    while True:
-        parent_job = await parent_queue.get()
-        if parent_job is None:
-            break
-        tasks.append(asyncio.create_task(run_one(parent_job)))
-        parent_queue.task_done()
-    
-    if tasks:
-        await asyncio.gather(*tasks)
-
-async def token_worker(token: str, token_label: str, queue: asyncio.Queue,
-                        results: Dict[str, list], stats: RunStats, github_session: aiohttp.ClientSession,
-                        parent_queue: asyncio.Queue):
-    sem = asyncio.Semaphore(CONCURRENCY_PER_TOKEN)
-
-    async def run_one(batch):
-        async with sem:
-            await process_batch(batch, token, results, github_session, stats, token_label, parent_queue)
-            # Small delay to prevent secondary rate limits
-            await asyncio.sleep(1)
-
-    tasks = []
-    while True:
-        batch = await queue.get()
-        if batch is None:
-            queue.task_done()
-            break
-        tasks.append(asyncio.create_task(run_one(batch)))
-        queue.task_done()
-    if tasks:
-        await asyncio.gather(*tasks)
-
 async def fetch_jobs(http_session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     for attempt in range(5):
         try:
@@ -314,29 +254,27 @@ async def post_work(http_session: aiohttp.ClientSession, results: Dict[str, list
         print(f"[{ts()} post] Failed to post work: {e}")
 
 async def run_one_round(tokens: List[str], jobs: List[Dict[str, Any]], stats: RunStats, github_session: aiohttp.ClientSession) -> Dict[str, list]:
-    queue = asyncio.Queue()
-    parent_queue = asyncio.Queue()
-    
-    for i in range(0, len(jobs), BATCH_SIZE):
-        await queue.put(jobs[i:i + BATCH_SIZE])
-    for _ in tokens:
-        await queue.put(None)
-
     results = {"metadata": [], "errors": []}
+    tasks = []
     
-    # Start parent worker in the background
-    parent_task = asyncio.create_task(parent_queue_worker(parent_queue, tokens, results, stats, github_session))
+    # Pre-slice into batches of 100
+    batches = [jobs[i:i + BATCH_SIZE] for i in range(0, len(jobs), BATCH_SIZE)]
     
-    workers = [
-        asyncio.create_task(token_worker(t, f"tok{idx+1}", queue, results, stats, github_session, parent_queue))
-        for idx, t in enumerate(tokens)
-    ]
-    
-    await queue.join()
-    # Wait for all parents to be processed
-    await parent_queue.put(None)
-    await parent_task
-    
+    async def worker(batch, token, idx):
+        # Strict global concurrency limit
+        async with GLOBAL_SEM:
+            await process_batch(batch, token, results, github_session, stats, f"tok{idx+1}")
+            # Enforce a 1-second delay after every single batch to prevent secondary limits
+            await asyncio.sleep(1)
+
+    for i, batch in enumerate(batches):
+        token = tokens[i % len(tokens)]
+        tasks.append(asyncio.create_task(worker(batch, token, i)))
+
+    # Wait for ALL batches in this 10k round to finish
+    if tasks:
+        await asyncio.gather(*tasks)
+        
     return results
 
 async def main():
