@@ -8,20 +8,15 @@ from typing import List, Dict, Any
 API = "https://api.github.com/graphql"
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "http://localhost:7860")
 
-# Stop pulling new job batches once this much wall-clock time has elapsed,
-# so we leave enough headroom to finish in-flight work and post results
-# before the GitHub Actions job timeout kills the process.
-MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 30 * 60)))  # 5h30m default
+MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 30 * 60)))
 CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "2"))
 BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "100"))
-
 
 def load_tokens() -> list[str]:
     multi = os.environ.get("GITHUB_TOKENS", "").strip()
     if multi:
         return [t.strip() for t in multi.split(",") if t.strip()]
     return []
-
 
 def auth_headers(token: str) -> dict:
     return {
@@ -30,12 +25,10 @@ def auth_headers(token: str) -> dict:
         "User-Agent": "python-dataset-pipeline"
     }
 
-
 def escape_graphql_string(s: str) -> str:
     if not s:
         return ""
     return s.replace("\\", "\\\\").replace("\"", "\\\"")
-
 
 def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
     aliases = []
@@ -70,7 +63,6 @@ def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
 
     return "query { " + " ".join(aliases) + " }"
 
-
 def extract_lang_data(lang_graphql: dict) -> dict:
     if not lang_graphql:
         return {}, 0, 0, 0.0
@@ -81,7 +73,6 @@ def extract_lang_data(lang_graphql: dict) -> dict:
     py_bytes = langs.get("Python", 0)
     pct = round((100.0 * py_bytes / total_size), 2) if total_size > 0 else 0.0
     return langs, py_bytes, total_size, pct
-
 
 def repo_data_to_metadata_row(rid: int, repo_data: dict) -> dict:
     langs, py_bytes, total_bytes, pct = extract_lang_data(repo_data.get("languages"))
@@ -103,9 +94,7 @@ def repo_data_to_metadata_row(rid: int, repo_data: dict) -> dict:
         "python_pct": pct,
     }
 
-
 class RunStats:
-    """Tracks running totals across the whole workflow run for periodic summary logging."""
     def __init__(self):
         self.batches_done = 0
         self.jobs_ok = 0
@@ -123,7 +112,6 @@ class RunStats:
                 f"not_found={self.not_found} http_err={self.http_errors} "
                 f"exceptions={self.exceptions} rate_limited={self.rate_limited}")
 
-
 async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[str, list],
                          session: aiohttp.ClientSession, stats: RunStats, token_label: str):
     if not jobs:
@@ -131,84 +119,106 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
 
     query = build_graphql_query(jobs)
     headers = auth_headers(token)
+    max_retries = 5
 
-    try:
-        async with session.post(API, json={"query": query}, headers=headers, timeout=30) as response:
-            if response.status == 200:
-                data = await response.json()
+    for attempt in range(max_retries):
+        try:
+            async with session.post(API, json={"query": query}, headers=headers, timeout=30) as response:
+                if response.status == 200:
+                    data = await response.json()
 
-                if "errors" in data:
-                    graph_data = data.get("data", {})
-                    batch_not_found = 0
+                    if "errors" in data:
+                        graph_data = data.get("data", {})
+                        batch_not_found = 0
 
-                    if graph_data:
-                        for i, job in enumerate(jobs):
-                            rid = job["repo_id"]
-                            repo_data = graph_data.get(f"repo{i}")
-                            if repo_data is None:
-                                results["errors"].append({"repo_id": rid, "error": "not_found_or_deleted"})
-                                batch_not_found += 1
-                                continue
-                            results["metadata"].append(repo_data_to_metadata_row(rid, repo_data))
+                        if graph_data:
+                            for i, job in enumerate(jobs):
+                                rid = job["repo_id"]
+                                repo_data = graph_data.get(f"repo{i}")
+                                if repo_data is None:
+                                    results["errors"].append({"repo_id": rid, "error": "not_found_or_deleted"})
+                                    batch_not_found += 1
+                                    continue
+                                results["metadata"].append(repo_data_to_metadata_row(rid, repo_data))
 
-                        recovered = len(jobs) - batch_not_found
-                        stats.jobs_ok += recovered
-                        stats.jobs_error += batch_not_found
-                        stats.not_found += batch_not_found
-                        # Only print detail for batches that recovered poorly - otherwise this is just normal churn
-                        if recovered < len(jobs) * 0.8:
+                            recovered = len(jobs) - batch_not_found
+                            stats.jobs_ok += recovered
+                            stats.jobs_error += batch_not_found
+                            stats.not_found += batch_not_found
+                            if recovered < len(jobs) * 0.8:
+                                sample = str(data["errors"])[:300]
+                                print(f"[{token_label}] low recovery {recovered}/{len(jobs)} - sample: {sample}")
+                        else:
+                            for job in jobs:
+                                results["errors"].append({"repo_id": job["repo_id"], "error": "graphql_no_data"})
+                            stats.jobs_error += len(jobs)
                             sample = str(data["errors"])[:300]
-                            print(f"[{token_label}] low recovery {recovered}/{len(jobs)} - sample: {sample}")
-                    else:
-                        for job in jobs:
-                            results["errors"].append({"repo_id": job["repo_id"], "error": "graphql_no_data"})
-                        stats.jobs_error += len(jobs)
-                        sample = str(data["errors"])[:300]
-                        print(f"[{token_label}] batch failed entirely (no data) - sample: {sample}")
+                            print(f"[{token_label}] batch failed entirely (no data) - sample: {sample}")
+                        
+                        stats.batches_done += 1
+                        if stats.batches_done % 25 == 0:
+                            print(stats.line())
+                        return
+
+                    graph_data = data.get("data", {})
+                    batch_ok = 0
+                    batch_missing = 0
+                    for i, job in enumerate(jobs):
+                        rid = job["repo_id"]
+                        repo_data = graph_data.get(f"repo{i}")
+                        if repo_data is None:
+                            results["errors"].append({"repo_id": rid, "error": "not_found_or_deleted"})
+                            batch_missing += 1
+                            continue
+                        results["metadata"].append(repo_data_to_metadata_row(rid, repo_data))
+                        batch_ok += 1
+                    stats.jobs_ok += batch_ok
+                    stats.jobs_error += batch_missing
+                    stats.not_found += batch_missing
+
+                    stats.batches_done += 1
+                    if stats.batches_done % 25 == 0:
+                        print(stats.line())
                     return
 
-                graph_data = data.get("data", {})
-                batch_ok = 0
-                batch_missing = 0
-                for i, job in enumerate(jobs):
-                    rid = job["repo_id"]
-                    repo_data = graph_data.get(f"repo{i}")
-                    if repo_data is None:
-                        results["errors"].append({"repo_id": rid, "error": "not_found_or_deleted"})
-                        batch_missing += 1
-                        continue
-                    results["metadata"].append(repo_data_to_metadata_row(rid, repo_data))
-                    batch_ok += 1
-                stats.jobs_ok += batch_ok
-                stats.jobs_error += batch_missing
-                stats.not_found += batch_missing
+                elif response.status in (403, 429):
+                    stats.rate_limited += 1
+                    print(f"[{token_label}] rate limited (HTTP {response.status}), sleeping 60s (Attempt {attempt+1}/{max_retries})")
+                    await asyncio.sleep(60)
+                    continue
 
-            elif response.status in (403, 429):
-                stats.rate_limited += 1
-                print(f"[{token_label}] rate limited (HTTP {response.status}), sleeping 60s")
-                await asyncio.sleep(60)
-                await process_batch(jobs, token, results, session, stats, token_label)
-                return
+                elif response.status in (502, 503, 504):
+                    print(f"[{token_label}] HTTP {response.status}. Retrying... (Attempt {attempt+1}/{max_retries})")
+                    await asyncio.sleep(3)
+                    continue
 
-            else:
-                body = await response.text()
-                print(f"[{token_label}] HTTP {response.status}: {body[:200]}")
-                for job in jobs:
-                    results["errors"].append({"repo_id": job["repo_id"], "error": f"http_{response.status}"})
-                stats.jobs_error += len(jobs)
-                stats.http_errors += 1
+                else:
+                    body = await response.text()
+                    print(f"[{token_label}] HTTP {response.status}: {body[:200]}")
+                    for job in jobs:
+                        results["errors"].append({"repo_id": job["repo_id"], "error": f"http_{response.status}"})
+                    stats.jobs_error += len(jobs)
+                    stats.http_errors += 1
+                    
+                    stats.batches_done += 1
+                    if stats.batches_done % 25 == 0:
+                        print(stats.line())
+                    return
 
-    except Exception as e:
-        print(f"[{token_label}] exception: {e!r}")
-        for job in jobs:
-            results["errors"].append({"repo_id": job["repo_id"], "error": str(e)[:100]})
-        stats.jobs_error += len(jobs)
-        stats.exceptions += 1
+        except Exception as e:
+            print(f"[{token_label}] exception: {e!r}. Retrying... (Attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(3)
+            continue
 
+    print(f"[{token_label}] Max retries exceeded for batch. Marking as error.")
+    for job in jobs:
+        results["errors"].append({"repo_id": job["repo_id"], "error": "max_retries_exceeded"})
+    stats.jobs_error += len(jobs)
+    stats.exceptions += 1
+    
     stats.batches_done += 1
     if stats.batches_done % 25 == 0:
         print(stats.line())
-
 
 async def token_worker(token: str, token_label: str, queue: asyncio.Queue,
                         results: Dict[str, list], stats: RunStats):
@@ -230,7 +240,6 @@ async def token_worker(token: str, token_label: str, queue: asyncio.Queue,
         if tasks:
             await asyncio.gather(*tasks)
 
-
 async def fetch_jobs(http_session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     for attempt in range(5):
         try:
@@ -245,7 +254,6 @@ async def fetch_jobs(http_session: aiohttp.ClientSession) -> List[Dict[str, Any]
         await asyncio.sleep(15)
     return []
 
-
 async def post_work(http_session: aiohttp.ClientSession, results: Dict[str, list]):
     try:
         async with http_session.post(f"{HF_SPACE_URL}/post-work", json=results, timeout=60) as resp:
@@ -253,7 +261,6 @@ async def post_work(http_session: aiohttp.ClientSession, results: Dict[str, list
             print(f"Posted: {post_resp}")
     except Exception as e:
         print(f"Failed to post work: {e}")
-
 
 async def run_one_round(tokens: List[str], jobs: List[Dict[str, Any]], stats: RunStats) -> Dict[str, list]:
     queue = asyncio.Queue()
@@ -270,7 +277,6 @@ async def run_one_round(tokens: List[str], jobs: List[Dict[str, Any]], stats: Ru
     await queue.join()
     await asyncio.gather(*workers)
     return results
-
 
 async def main():
     tokens = load_tokens()
@@ -308,7 +314,6 @@ async def main():
           f"{stats.jobs_ok} ok | {stats.jobs_error} error "
           f"({stats.not_found} not_found, {stats.http_errors} http_err batches, "
           f"{stats.exceptions} exceptions, {stats.rate_limited} rate_limit hits) ===")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
