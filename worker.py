@@ -207,8 +207,19 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
 
                 elif response.status in (403, 429):
                     stats.rate_limited += 1
-                    print(f"[{token_label}] rate limited (HTTP {response.status}), sleeping 60s (Attempt {attempt+1}/{max_retries})")
-                    await asyncio.sleep(60)
+                    # Read the exact error message from GitHub
+                    body = await response.text()
+                    print(f"[{token_label}] HTTP {response.status} (Attempt {attempt+1}/{max_retries}): {body[:200]}")
+                    
+                    # Check for Retry-After header (Secondary limit)
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        sleep_time = int(retry_after) + 2
+                    else:
+                        sleep_time = 60
+                        
+                    print(f"[{token_label}] Sleeping for {sleep_time}s...")
+                    await asyncio.sleep(sleep_time)
                     continue
 
                 elif response.status in (502, 503, 504):
@@ -250,6 +261,8 @@ async def token_worker(token: str, token_label: str, queue: asyncio.Queue,
     async def run_one(batch):
         async with sem:
             await process_batch(batch, token, results, github_session, stats, token_label)
+            # Add a 1-second delay after finishing a batch to prevent secondary rate limits
+            await asyncio.sleep(1)
 
     tasks = []
     while True:
