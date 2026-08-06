@@ -42,8 +42,8 @@ jobs:
         env:
           GITHUB_TOKENS: ${{ secrets.GH_TOKENS }}
           HF_SPACE_URL: ${{ secrets.HF_SPACE_URL }}
-          CONCURRENCY_PER_TOKEN: "2"
-          GRAPHQL_BATCH_SIZE: "100"
+          CONCURRENCY_PER_TOKEN: "3"
+          GRAPHQL_BATCH_SIZE: "200"
           MAX_RUNTIME_SECONDS: ${{ steps.budget.outputs.seconds }}
           PYTHONUNBUFFERED: "1"
         run: python worker.py
