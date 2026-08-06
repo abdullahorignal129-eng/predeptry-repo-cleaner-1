@@ -42,14 +42,24 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 3
 # Given that, throughput comes from BATCH SIZE (more repos per request,
 # staying under the 10s timeout) far more than from concurrency, which is
 # capped low and actively discouraged by GitHub itself.
+#
+# --- Locked to the "average" sweet spot ---
+# Modeling showed batch=400 (near the 10s wall) is NOT actually faster than
+# batch~200: once response time gets close to the server timeout, latency
+# eats the gain from bigger batches. ~200 repos/request is the point where
+# you get near-maximum throughput (~200 repos/sec across 3 tokens, ~720k/hr)
+# without flirting with the 10s cutoff. So the adaptive ceiling is capped
+# here instead of left free to climb toward 400 - it will still shrink below
+# this if real responses run slow, but won't push past it looking for more.
 CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "1"))
 BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "200"))
-MIN_BATCH_SIZE = int(os.environ.get("GRAPHQL_MIN_BATCH_SIZE", "25"))
-MAX_BATCH_SIZE = int(os.environ.get("GRAPHQL_MAX_BATCH_SIZE", "400"))
+MIN_BATCH_SIZE = int(os.environ.get("GRAPHQL_MIN_BATCH_SIZE", "50"))
+MAX_BATCH_SIZE = int(os.environ.get("GRAPHQL_MAX_BATCH_SIZE", "250"))
 
 # Server timeout is a hard 10s (GitHub docs). We target well under that so a
 # batch that's a bit slower than usual doesn't get server-killed and penalized.
-TARGET_RESPONSE_SECONDS = float(os.environ.get("TARGET_RESPONSE_SECONDS", "5.0"))
+# Sweet-spot target: keep responses in the 2-4s band, not racing toward 10s.
+TARGET_RESPONSE_SECONDS = float(os.environ.get("TARGET_RESPONSE_SECONDS", "3.0"))
 HARD_SERVER_TIMEOUT_SECONDS = 10.0
 
 # Minimum gap between the *start* of consecutive requests from the same token,
