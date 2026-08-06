@@ -1,8 +1,10 @@
+# worker.py
 import os
 import time
 import asyncio
 import aiohttp
 import json
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 API = "https://api.github.com/graphql"
@@ -139,8 +141,6 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                         # Proactive Rate-Limit Guard: Sleep if running dangerously low
                         if remaining < 150 and reset_at:
                             try:
-                                # Convert ISO 8601 string (e.g., 2026-08-06T12:34:56Z) to timestamp
-                                from datetime import datetime, timezone
                                 reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
                                 sleep_seconds = max(int((reset_dt - datetime.now(timezone.utc)).total_seconds()) + 5, 10)
                                 print(f"[{token_label}] WARNING: Token low ({remaining} rem). Proactively sleeping for {sleep_seconds}s until reset.")
@@ -224,21 +224,6 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                     if stats.batches_done % 25 == 0:
                         print(stats.line())
                     return
-
-        except Exception as e:
-            print(f"[{token_label}] exception: {e!r}. Retrying... (Attempt {attempt+1}/{max_retries})")
-            await asyncio.sleep(3)
-            continue
-
-    print(f"[{token_label}] Max retries exceeded for batch. Marking as error.")
-    for job in jobs:
-        results["errors"].append({"repo_id": job["repo_id"], "error": "max_retries_exceeded"})
-    stats.jobs_error += len(jobs)
-    stats.exceptions += 1
-    stats.batches_done += 1
-    if stats.batches_done % 25 == 0:
-        print(stats.line())
-
 
         except Exception as e:
             print(f"[{token_label}] exception: {e!r}. Retrying... (Attempt {attempt+1}/{max_retries})")
