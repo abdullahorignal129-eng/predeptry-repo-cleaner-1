@@ -12,11 +12,6 @@ HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "http://localhost:7860")
 
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 30 * 60)))
 BATCH_SIZE = 100
-CONCURRENCY_PER_TOKEN = 3
-
-# Global semaphore to strictly limit total concurrent requests across all tokens.
-# 3 tokens * 3 concurrent = 9 max requests at a time.
-GLOBAL_SEM = asyncio.Semaphore(CONCURRENCY_PER_TOKEN * 10) 
 
 def ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
@@ -231,6 +226,20 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
     stats.jobs_error += len(jobs)
     stats.exceptions += 1
 
+async def token_worker(token: str, token_label: str, queue: asyncio.Queue,
+                        results: Dict[str, list], stats: RunStats, github_session: aiohttp.ClientSession):
+    
+    while True:
+        batch = await queue.get()
+        if batch is None:
+            queue.task_done()
+            break
+            
+        await process_batch(batch, token, results, github_session, stats, token_label)
+        # Strict 2-second delay to guarantee no secondary rate limits
+        await asyncio.sleep(2)
+        queue.task_done()
+
 async def fetch_jobs(http_session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     for attempt in range(5):
         try:
@@ -254,27 +263,21 @@ async def post_work(http_session: aiohttp.ClientSession, results: Dict[str, list
         print(f"[{ts()} post] Failed to post work: {e}")
 
 async def run_one_round(tokens: List[str], jobs: List[Dict[str, Any]], stats: RunStats, github_session: aiohttp.ClientSession) -> Dict[str, list]:
+    queue = asyncio.Queue()
+    
+    for i in range(0, len(jobs), BATCH_SIZE):
+        await queue.put(jobs[i:i + BATCH_SIZE])
+    for _ in tokens:
+        await queue.put(None)
+
     results = {"metadata": [], "errors": []}
-    tasks = []
+    workers = [
+        asyncio.create_task(token_worker(t, f"tok{idx+1}", queue, results, stats, github_session))
+        for idx, t in enumerate(tokens)
+    ]
     
-    # Pre-slice into batches of 100
-    batches = [jobs[i:i + BATCH_SIZE] for i in range(0, len(jobs), BATCH_SIZE)]
-    
-    async def worker(batch, token, idx):
-        # Strict global concurrency limit
-        async with GLOBAL_SEM:
-            await process_batch(batch, token, results, github_session, stats, f"tok{idx+1}")
-            # Enforce a 1-second delay after every single batch to prevent secondary limits
-            await asyncio.sleep(1)
-
-    for i, batch in enumerate(batches):
-        token = tokens[i % len(tokens)]
-        tasks.append(asyncio.create_task(worker(batch, token, i)))
-
-    # Wait for ALL batches in this 10k round to finish
-    if tasks:
-        await asyncio.gather(*tasks)
-        
+    await queue.join()
+    await asyncio.gather(*workers)
     return results
 
 async def main():
@@ -283,8 +286,7 @@ async def main():
         print("WARNING: no tokens provided. Set GITHUB_TOKENS secret.")
         return
 
-    print(f"[{ts()} init] Loaded {len(tokens)} token(s), {CONCURRENCY_PER_TOKEN} concurrent requests/token, "
-          f"batch size {BATCH_SIZE}, max runtime {MAX_RUNTIME_SECONDS}s")
+    print(f"[{ts()} init] Loaded {len(tokens)} token(s). Strict 1 req per token / 2s delay. Batch size {BATCH_SIZE}. Max runtime {MAX_RUNTIME_SECONDS}s")
 
     stats = RunStats()
     start = time.monotonic()
