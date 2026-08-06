@@ -11,8 +11,8 @@ API = "https://api.github.com/graphql"
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "http://localhost:7860")
 
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 30 * 60)))
+# Increased default concurrency from 3 to 5
 CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "3"))
-# Reverted to 100. GitHub will 502/504 if you go higher than 100 aliases.
 BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "100")) 
 
 def load_tokens() -> list[str]:
@@ -45,7 +45,6 @@ def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
         owner_esc = escape_graphql_string(owner)
         name_esc = escape_graphql_string(name)
 
-        # Reduced languages to 5 to lower query complexity and prevent 502s
         aliases.append(f'''
         repo{i}: repository(owner: "{owner_esc}", name: "{name_esc}") {{
             nameWithOwner
@@ -133,7 +132,6 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                     try:
                         data = await response.json()
                     except Exception:
-                        # GitHub returned a 200 OK but with invalid JSON (rare, but happens)
                         raise Exception("Invalid JSON response")
                     
                     if data is None:
@@ -141,14 +139,12 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                         
                     graph_data = data.get("data", {}) or {} 
                     
-                    # Safe rate limit logging & automatic proactive sleep guard
                     if "rateLimit" in graph_data:
                         rl = graph_data["rateLimit"]
                         remaining = rl.get("remaining", 5000)
                         reset_at = rl.get("resetAt")
                         print(f"[{token_label}] Cost: {rl.get('cost')} | Rem: {remaining}/5000 | Resets: {reset_at}")
                         
-                        # Proactive Rate-Limit Guard
                         if remaining < 150 and reset_at:
                             try:
                                 reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
@@ -158,7 +154,6 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                             except Exception:
                                 await asyncio.sleep(60)
 
-                    # Handle case where GraphQL returned partial data + an errors array
                     if "errors" in data:
                         batch_not_found = 0
                         if graph_data:
@@ -190,7 +185,6 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                             print(stats.line())
                         return
 
-                    # Handle standard clean 200 OK responses with no errors
                     batch_ok = 0
                     batch_missing = 0
                     for i, job in enumerate(jobs):
@@ -250,24 +244,23 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
         print(stats.line())
 
 async def token_worker(token: str, token_label: str, queue: asyncio.Queue,
-                        results: Dict[str, list], stats: RunStats):
+                        results: Dict[str, list], stats: RunStats, github_session: aiohttp.ClientSession):
     sem = asyncio.Semaphore(CONCURRENCY_PER_TOKEN)
 
-    async def run_one(batch, session):
+    async def run_one(batch):
         async with sem:
-            await process_batch(batch, token, results, session, stats, token_label)
+            await process_batch(batch, token, results, github_session, stats, token_label)
 
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        while True:
-            batch = await queue.get()
-            if batch is None:
-                queue.task_done()
-                break
-            tasks.append(asyncio.create_task(run_one(batch, session)))
+    tasks = []
+    while True:
+        batch = await queue.get()
+        if batch is None:
             queue.task_done()
-        if tasks:
-            await asyncio.gather(*tasks)
+            break
+        tasks.append(asyncio.create_task(run_one(batch)))
+        queue.task_done()
+    if tasks:
+        await asyncio.gather(*tasks)
 
 async def fetch_jobs(http_session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     for attempt in range(5):
@@ -291,7 +284,7 @@ async def post_work(http_session: aiohttp.ClientSession, results: Dict[str, list
     except Exception as e:
         print(f"Failed to post work: {e}")
 
-async def run_one_round(tokens: List[str], jobs: List[Dict[str, Any]], stats: RunStats) -> Dict[str, list]:
+async def run_one_round(tokens: List[str], jobs: List[Dict[str, Any]], stats: RunStats, github_session: aiohttp.ClientSession) -> Dict[str, list]:
     queue = asyncio.Queue()
     for i in range(0, len(jobs), BATCH_SIZE):
         await queue.put(jobs[i:i + BATCH_SIZE])
@@ -300,7 +293,7 @@ async def run_one_round(tokens: List[str], jobs: List[Dict[str, Any]], stats: Ru
 
     results = {"metadata": [], "errors": []}
     workers = [
-        asyncio.create_task(token_worker(t, f"tok{idx+1}", queue, results, stats))
+        asyncio.create_task(token_worker(t, f"tok{idx+1}", queue, results, stats, github_session))
         for idx, t in enumerate(tokens)
     ]
     await queue.join()
@@ -320,7 +313,13 @@ async def main():
     start = time.monotonic()
     round_num = 0
 
-    async with aiohttp.ClientSession() as http_session:
+    # Use a shared connection pool for GitHub API to reduce TCP handshake latency
+    connector = aiohttp.TCPConnector(limit=100)
+    
+    # We use two sessions: one for GitHub (high concurrency) and one for HF Space
+    async with aiohttp.ClientSession() as hf_session, aiohttp.ClientSession(connector=connector) as github_session:
+        background_uploads = []
+        
         while True:
             elapsed = time.monotonic() - start
             if elapsed > MAX_RUNTIME_SECONDS:
@@ -328,15 +327,23 @@ async def main():
                 break
 
             round_num += 1
-            jobs = await fetch_jobs(http_session)
+            jobs = await fetch_jobs(hf_session)
             if not jobs:
                 print("No jobs received after retries. Queue is likely empty. Exiting.")
                 break
 
             print(f"[round {round_num}] received {len(jobs)} jobs")
-            results = await run_one_round(tokens, jobs, stats)
-            await post_work(http_session, results)
+            results = await run_one_round(tokens, jobs, stats, github_session)
+            
+            # PIPELINE OPTIMIZATION: Fire the upload in the background and immediately fetch the next batch!
+            background_uploads.append(asyncio.create_task(post_work(hf_session, results)))
+            
             print(stats.line())
+
+        # Wait for any remaining background uploads to finish before exiting
+        if background_uploads:
+            print("Waiting for final background uploads to complete...")
+            await asyncio.gather(*background_uploads)
 
     total = stats.jobs_ok + stats.jobs_error
     print(f"=== Run complete: {total} jobs processed | "
