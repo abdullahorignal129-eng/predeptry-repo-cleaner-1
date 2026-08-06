@@ -14,6 +14,10 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 3
 CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "3"))
 BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "100")) 
 
+def ts() -> str:
+    """Returns current time as HH:MM:SS for logging."""
+    return datetime.now().strftime("%H:%M:%S")
+
 def load_tokens() -> list[str]:
     multi = os.environ.get("GITHUB_TOKENS", "").strip()
     if multi:
@@ -44,7 +48,6 @@ def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
         owner_esc = escape_graphql_string(owner)
         name_esc = escape_graphql_string(name)
 
-        # REMOVED: issues(states: [OPEN]) { totalCount } to prevent 403 Secondary Rate Limits
         aliases.append(f'''
         repo{i}: repository(owner: "{owner_esc}", name: "{name_esc}") {{
             nameWithOwner
@@ -85,7 +88,7 @@ def repo_data_to_metadata_row(rid: int, repo_data: dict) -> dict:
         "description": repo_data.get("description"),
         "stars": repo_data.get("stargazerCount"),
         "forks_count": repo_data.get("forkCount"),
-        "open_issues": 0,  # Explicitly set to 0 since we no longer query it
+        "open_issues": 0,  # Explicitly set to 0
         "license": (repo_data.get("licenseInfo") or {}).get("spdxId"),
         "archived": 1 if repo_data.get("isArchived") else 0,
         "created_at": repo_data.get("createdAt"),
@@ -110,7 +113,7 @@ class RunStats:
     def line(self) -> str:
         total = self.jobs_ok + self.jobs_error
         rate = (100.0 * self.jobs_ok / total) if total else 0.0
-        return (f"[progress] batches={self.batches_done} jobs_ok={self.jobs_ok} "
+        return (f"[{ts()} progress] batches={self.batches_done} jobs_ok={self.jobs_ok} "
                 f"jobs_error={self.jobs_error} ({rate:.1f}% ok) "
                 f"not_found={self.not_found} http_err={self.http_errors} "
                 f"exceptions={self.exceptions} rate_limited={self.rate_limited}")
@@ -142,13 +145,13 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                         rl = graph_data["rateLimit"]
                         remaining = rl.get("remaining", 5000)
                         reset_at = rl.get("resetAt")
-                        print(f"[{token_label}] Cost: {rl.get('cost')} | Rem: {remaining}/5000 | Resets: {reset_at}")
+                        print(f"[{ts()} {token_label}] Cost: {rl.get('cost')} | Rem: {remaining}/5000 | Resets: {reset_at}")
                         
                         if remaining < 150 and reset_at:
                             try:
                                 reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
                                 sleep_seconds = max(int((reset_dt - datetime.now(timezone.utc)).total_seconds()) + 5, 10)
-                                print(f"[{token_label}] WARNING: Token low ({remaining} rem). Proactively sleeping for {sleep_seconds}s until reset.")
+                                print(f"[{ts()} {token_label}] WARNING: Token low ({remaining} rem). Proactively sleeping for {sleep_seconds}s until reset.")
                                 await asyncio.sleep(sleep_seconds)
                             except Exception:
                                 await asyncio.sleep(60)
@@ -171,13 +174,13 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                             stats.not_found += batch_not_found
                             if recovered < len(jobs) * 0.8:
                                 sample = str(data["errors"])[:300]
-                                print(f"[{token_label}] low recovery {recovered}/{len(jobs)} - sample: {sample}")
+                                print(f"[{ts()} {token_label}] low recovery {recovered}/{len(jobs)} - sample: {sample}")
                         else:
                             for job in jobs:
                                 results["errors"].append({"repo_id": job["repo_id"], "error": "graphql_no_data"})
                             stats.jobs_error += len(jobs)
                             sample = str(data["errors"])[:300]
-                            print(f"[{token_label}] batch failed entirely (no data) - sample: {sample}")
+                            print(f"[{ts()} {token_label}] batch failed entirely (no data) - sample: {sample}")
                         
                         stats.batches_done += 1
                         if stats.batches_done % 25 == 0:
@@ -207,7 +210,7 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                 elif response.status in (403, 429):
                     stats.rate_limited += 1
                     body = await response.text()
-                    print(f"[{token_label}] HTTP {response.status} (Attempt {attempt+1}/{max_retries}): {body[:200]}")
+                    print(f"[{ts()} {token_label}] HTTP {response.status} (Attempt {attempt+1}/{max_retries}): {body[:200]}")
                     
                     retry_after = response.headers.get("Retry-After")
                     if retry_after:
@@ -215,18 +218,18 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                     else:
                         sleep_time = 60
                         
-                    print(f"[{token_label}] Sleeping for {sleep_time}s...")
+                    print(f"[{ts()} {token_label}] Sleeping for {sleep_time}s...")
                     await asyncio.sleep(sleep_time)
                     continue
 
                 elif response.status in (502, 503, 504):
-                    print(f"[{token_label}] HTTP {response.status}. Retrying... (Attempt {attempt+1}/{max_retries})")
+                    print(f"[{ts()} {token_label}] HTTP {response.status}. Retrying... (Attempt {attempt+1}/{max_retries})")
                     await asyncio.sleep(3)
                     continue
 
                 else:
                     body = await response.text()
-                    print(f"[{token_label}] HTTP {response.status}: {body[:200]}")
+                    print(f"[{ts()} {token_label}] HTTP {response.status}: {body[:200]}")
                     for job in jobs:
                         results["errors"].append({"repo_id": job["repo_id"], "error": f"http_{response.status}"})
                     stats.jobs_error += len(jobs)
@@ -237,11 +240,11 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                     return
 
         except Exception as e:
-            print(f"[{token_label}] exception: {e!r}. Retrying... (Attempt {attempt+1}/{max_retries})")
+            print(f"[{ts()} {token_label}] exception: {e!r}. Retrying... (Attempt {attempt+1}/{max_retries})")
             await asyncio.sleep(3)
             continue
 
-    print(f"[{token_label}] Max retries exceeded for batch. Marking as error.")
+    print(f"[{ts()} {token_label}] Max retries exceeded for batch. Marking as error.")
     for job in jobs:
         results["errors"].append({"repo_id": job["repo_id"], "error": "max_retries_exceeded"})
     stats.jobs_error += len(jobs)
@@ -258,7 +261,6 @@ async def token_worker(token: str, token_label: str, queue: asyncio.Queue,
     async def run_one(batch):
         async with sem:
             await process_batch(batch, token, results, github_session, stats, token_label)
-            # 3-second delay to prevent secondary rate limits
             await asyncio.sleep(3)
 
     tasks = []
@@ -280,9 +282,9 @@ async def fetch_jobs(http_session: aiohttp.ClientSession) -> List[Dict[str, Any]
                 jobs = data.get("jobs", [])
                 if jobs:
                     return jobs
-                print(f"No jobs available (attempt {attempt+1}/5), retrying in 15s...")
+                print(f"[{ts()} fetch] No jobs available (attempt {attempt+1}/5), retrying in 15s...")
         except Exception as e:
-            print(f"Error contacting HF Space: {e}, retrying in 15s...")
+            print(f"[{ts()} fetch] Error contacting HF Space: {e}, retrying in 15s...")
         await asyncio.sleep(15)
     return []
 
@@ -290,9 +292,9 @@ async def post_work(http_session: aiohttp.ClientSession, results: Dict[str, list
     try:
         async with http_session.post(f"{HF_SPACE_URL}/post-work", json=results, timeout=60) as resp:
             post_resp = await resp.json()
-            print(f"Posted: {post_resp}")
+            print(f"[{ts()} post] Posted: {post_resp}")
     except Exception as e:
-        print(f"Failed to post work: {e}")
+        print(f"[{ts()} post] Failed to post work: {e}")
 
 async def run_one_round(tokens: List[str], jobs: List[Dict[str, Any]], stats: RunStats, github_session: aiohttp.ClientSession) -> Dict[str, list]:
     queue = asyncio.Queue()
@@ -316,7 +318,7 @@ async def main():
         print("WARNING: no tokens provided. Set GITHUB_TOKENS secret.")
         return
 
-    print(f"Loaded {len(tokens)} token(s), {CONCURRENCY_PER_TOKEN} concurrent requests/token, "
+    print(f"[{ts()} init] Loaded {len(tokens)} token(s), {CONCURRENCY_PER_TOKEN} concurrent requests/token, "
           f"batch size {BATCH_SIZE}, max runtime {MAX_RUNTIME_SECONDS}s")
 
     stats = RunStats()
@@ -331,30 +333,40 @@ async def main():
         while True:
             elapsed = time.monotonic() - start
             if elapsed > MAX_RUNTIME_SECONDS:
-                print(f"Runtime budget reached ({elapsed:.0f}s), stopping.")
+                print(f"[{ts()} system] Runtime budget reached ({elapsed:.0f}s), stopping.")
                 break
 
             round_num += 1
             jobs = await fetch_jobs(hf_session)
             if not jobs:
-                print("No jobs received after retries. Queue is likely empty. Exiting.")
+                print(f"[{ts()} system] No jobs received after retries. Queue is likely empty. Exiting.")
                 break
 
-            print(f"[round {round_num}] received {len(jobs)} jobs")
+            print(f"\n[{ts()} system] === Round {round_num} starting === Received {len(jobs)} jobs. Total elapsed: {elapsed:.0f}s ===")
+            
+            # Start timer for this specific 10k batch
+            round_start = time.monotonic()
             results = await run_one_round(tokens, jobs, stats, github_session)
+            round_duration = time.monotonic() - round_start
             
-            # PIPELINE OPTIMIZATION: Fire the upload in the background
+            # Calculate live speed
+            rate = len(jobs) / round_duration if round_duration > 0 else 0
+            
+            print(f"[{ts()} system] === Round {round_num} finished in {round_duration:.1f}s ({rate:.1f} repos/sec) ===")
+            
             background_uploads.append(asyncio.create_task(post_work(hf_session, results)))
-            
             print(stats.line())
+            
+            # Print budget tracker
+            remaining_budget = MAX_RUNTIME_SECONDS - (time.monotonic() - start)
+            print(f"[{ts()} system] Runtime budget remaining: {remaining_budget:.0f}s\n")
 
-        # Wait for any remaining background uploads to finish before exiting
         if background_uploads:
-            print("Waiting for final background uploads to complete...")
+            print(f"[{ts()} system] Waiting for final background uploads to complete...")
             await asyncio.gather(*background_uploads)
 
     total = stats.jobs_ok + stats.jobs_error
-    print(f"=== Run complete: {total} jobs processed | "
+    print(f"[{ts()} system] === Run complete: {total} jobs processed | "
           f"{stats.jobs_ok} ok | {stats.jobs_error} error "
           f"({stats.not_found} not_found, {stats.http_errors} http_err batches, "
           f"{stats.exceptions} exceptions, {stats.rate_limited} rate_limit hits) ===")
