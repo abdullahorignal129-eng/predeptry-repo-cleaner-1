@@ -114,7 +114,7 @@ class RunStats:
                 f"exceptions={self.exceptions} rate_limited={self.rate_limited}")
 
 async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[str, list],
-                         session: aiohttp.ClientSession, stats: RunStats, token_label: str):
+                        session: aiohttp.ClientSession, stats: RunStats, token_label: str):
     if not jobs:
         return
 
@@ -127,16 +127,31 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
             async with session.post(API, json={"query": query}, headers=headers, timeout=30) as response:
                 if response.status == 200:
                     data = await response.json()
-                
-                    if graph_data and "rateLimit" in graph_data:
-                          rl = graph_data["rateLimit"]
-                          print(f"[{token_label}] Call Cost: {rl.get('cost')} | "
-                                f"Remaining: {rl.get('remaining')}/5000 | Resets At: {rl.get('resetAt')}")
+                    graph_data = data.get("data", {}) or {} 
+                    
+                    # Safe rate limit logging & automatic proactive sleep guard
+                    if "rateLimit" in graph_data:
+                        rl = graph_data["rateLimit"]
+                        remaining = rl.get("remaining", 5000)
+                        reset_at = rl.get("resetAt")
+                        print(f"[{token_label}] Cost: {rl.get('cost')} | Rem: {remaining}/5000 | Resets: {reset_at}")
+                        
+                        # Proactive Rate-Limit Guard: Sleep if running dangerously low
+                        if remaining < 150 and reset_at:
+                            try:
+                                # Convert ISO 8601 string (e.g., 2026-08-06T12:34:56Z) to timestamp
+                                from datetime import datetime, timezone
+                                reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+                                sleep_seconds = max(int((reset_dt - datetime.now(timezone.utc)).total_seconds()) + 5, 10)
+                                print(f"[{token_label}] WARNING: Token low ({remaining} rem). Proactively sleeping for {sleep_seconds}s until reset.")
+                                await asyncio.sleep(sleep_seconds)
+                            except Exception as parse_err:
+                                print(f"[{token_label}] Error parsing reset time, falling back to standard 60s sleep. Error: {parse_err}")
+                                await asyncio.sleep(60)
 
+                    # Handle case where GraphQL returned partial data + an errors array
                     if "errors" in data:
-                        graph_data = data.get("data", {})
                         batch_not_found = 0
-
                         if graph_data:
                             for i, job in enumerate(jobs):
                                 rid = job["repo_id"]
@@ -166,7 +181,7 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                             print(stats.line())
                         return
 
-                    graph_data = data.get("data", {})
+                    # Handle standard clean 200 OK responses with no errors
                     batch_ok = 0
                     batch_missing = 0
                     for i, job in enumerate(jobs):
@@ -205,11 +220,25 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                         results["errors"].append({"repo_id": job["repo_id"], "error": f"http_{response.status}"})
                     stats.jobs_error += len(jobs)
                     stats.http_errors += 1
-                    
                     stats.batches_done += 1
                     if stats.batches_done % 25 == 0:
                         print(stats.line())
                     return
+
+        except Exception as e:
+            print(f"[{token_label}] exception: {e!r}. Retrying... (Attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(3)
+            continue
+
+    print(f"[{token_label}] Max retries exceeded for batch. Marking as error.")
+    for job in jobs:
+        results["errors"].append({"repo_id": job["repo_id"], "error": "max_retries_exceeded"})
+    stats.jobs_error += len(jobs)
+    stats.exceptions += 1
+    stats.batches_done += 1
+    if stats.batches_done % 25 == 0:
+        print(stats.line())
+
 
         except Exception as e:
             print(f"[{token_label}] exception: {e!r}. Retrying... (Attempt {attempt+1}/{max_retries})")
