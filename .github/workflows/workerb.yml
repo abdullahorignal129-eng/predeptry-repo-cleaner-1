@@ -1,4 +1,4 @@
-name: Scrape GitHub Repo Metadata
+name: Scrape GitHub Repo Metadata - 2
 on:
   workflow_dispatch:
     inputs:
