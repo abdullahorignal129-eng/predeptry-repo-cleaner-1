@@ -12,7 +12,8 @@ HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "http://localhost:7860")
 
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 30 * 60)))
 CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "3"))
-BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "200")) 
+# Reverted to 100. GitHub will 502/504 if you go higher than 100 aliases.
+BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "100")) 
 
 def load_tokens() -> list[str]:
     multi = os.environ.get("GITHUB_TOKENS", "").strip()
@@ -44,6 +45,7 @@ def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
         owner_esc = escape_graphql_string(owner)
         name_esc = escape_graphql_string(name)
 
+        # Reduced languages to 5 to lower query complexity and prevent 502s
         aliases.append(f'''
         repo{i}: repository(owner: "{owner_esc}", name: "{name_esc}") {{
             nameWithOwner
@@ -56,14 +58,14 @@ def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
             createdAt
             updatedAt
             pushedAt
-            languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
+            languages(first: 5, orderBy: {{field: SIZE, direction: DESC}}) {{
                 totalSize
                 edges {{ node {{ name }} size }}
             }}
         }}
         ''')
 
-    aliases.append("rateLimit { cost remaining resetAt }") # Added rateLimit
+    aliases.append("rateLimit { cost remaining resetAt }")
     return "query { " + " ".join(aliases) + " }"
 
 def extract_lang_data(lang_graphql: dict) -> dict:
@@ -128,7 +130,15 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
         try:
             async with session.post(API, json={"query": query}, headers=headers, timeout=30) as response:
                 if response.status == 200:
-                    data = await response.json()
+                    try:
+                        data = await response.json()
+                    except Exception:
+                        # GitHub returned a 200 OK but with invalid JSON (rare, but happens)
+                        raise Exception("Invalid JSON response")
+                    
+                    if data is None:
+                        raise Exception("Response JSON is None")
+                        
                     graph_data = data.get("data", {}) or {} 
                     
                     # Safe rate limit logging & automatic proactive sleep guard
@@ -138,15 +148,14 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                         reset_at = rl.get("resetAt")
                         print(f"[{token_label}] Cost: {rl.get('cost')} | Rem: {remaining}/5000 | Resets: {reset_at}")
                         
-                        # Proactive Rate-Limit Guard: Sleep if running dangerously low
+                        # Proactive Rate-Limit Guard
                         if remaining < 150 and reset_at:
                             try:
                                 reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
                                 sleep_seconds = max(int((reset_dt - datetime.now(timezone.utc)).total_seconds()) + 5, 10)
                                 print(f"[{token_label}] WARNING: Token low ({remaining} rem). Proactively sleeping for {sleep_seconds}s until reset.")
                                 await asyncio.sleep(sleep_seconds)
-                            except Exception as parse_err:
-                                print(f"[{token_label}] Error parsing reset time, falling back to standard 60s sleep. Error: {parse_err}")
+                            except Exception:
                                 await asyncio.sleep(60)
 
                     # Handle case where GraphQL returned partial data + an errors array
