@@ -61,6 +61,7 @@ def build_graphql_query(jobs: List[Dict[str, Any]]) -> str:
         }}
         ''')
 
+    aliases.append("rateLimit { cost remaining resetAt }") # Added rateLimit
     return "query { " + " ".join(aliases) + " }"
 
 def extract_lang_data(lang_graphql: dict) -> dict:
@@ -126,6 +127,11 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
             async with session.post(API, json={"query": query}, headers=headers, timeout=30) as response:
                 if response.status == 200:
                     data = await response.json()
+                
+                    if graph_data and "rateLimit" in graph_data:
+                          rl = graph_data["rateLimit"]
+                          print(f"[{token_label}] Call Cost: {rl.get('cost')} | "
+                                f"Remaining: {rl.get('remaining')}/5000 | Resets At: {rl.get('resetAt')}")
 
                     if "errors" in data:
                         graph_data = data.get("data", {})
