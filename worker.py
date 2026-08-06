@@ -51,9 +51,14 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(5 * 3600 + 3
 # without flirting with the 10s cutoff. So the adaptive ceiling is capped
 # here instead of left free to climb toward 400 - it will still shrink below
 # this if real responses run slow, but won't push past it looking for more.
+#
+# MIN_BATCH_SIZE raised to 130: shrinking all the way to 50 loses too much
+# throughput for what's usually a transient GitHub-side issue (502s, null
+# response bodies) rather than a genuinely oversized batch. 130 is still a
+# real reduction from 200 if responses are truly slow, without over-correcting.
 CONCURRENCY_PER_TOKEN = int(os.environ.get("CONCURRENCY_PER_TOKEN", "1"))
 BATCH_SIZE = int(os.environ.get("GRAPHQL_BATCH_SIZE", "200"))
-MIN_BATCH_SIZE = int(os.environ.get("GRAPHQL_MIN_BATCH_SIZE", "50"))
+MIN_BATCH_SIZE = int(os.environ.get("GRAPHQL_MIN_BATCH_SIZE", "130"))
 MAX_BATCH_SIZE = int(os.environ.get("GRAPHQL_MAX_BATCH_SIZE", "250"))
 
 # Server timeout is a hard 10s (GitHub docs). We target well under that so a
@@ -307,11 +312,24 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
 
                     pacer.register_success()
                     elapsed = time.monotonic() - req_start
+
+                    graph_data = data.get("data")
+                    if graph_data is None:
+                        # GitHub occasionally returns HTTP 200 with a null/malformed
+                        # body during backend instability (often alongside upstream
+                        # 502s, as seen in practice). This is not a "batch too big"
+                        # signal - it's a transient server fault - so we retry
+                        # without feeding it to the adaptive sizer, which would
+                        # otherwise misread it as a timeout and shrink for no reason.
+                        print(f"[{ts()} {token_label}] HTTP 200 but null/empty data body "
+                              f"(Attempt {attempt+1}/{max_retries}) - transient GitHub fault, retrying")
+                        await asyncio.sleep(3 + random.uniform(0, 2))
+                        continue
+
                     if sizer is not None:
                         await sizer.record(len(jobs), elapsed, timed_out=False)
-                    graph_data = data.get("data", {}) or {}
 
-                    if "rateLimit" in graph_data:
+                    if "rateLimit" in graph_data and graph_data["rateLimit"] is not None:
                         rl = graph_data["rateLimit"]
                         remaining = rl.get("remaining", 5000)
                         reset_at = rl.get("resetAt")
@@ -325,6 +343,13 @@ async def process_batch(jobs: List[Dict[str, Any]], token: str, results: Dict[st
                                 await asyncio.sleep(sleep_seconds)
                             except Exception:
                                 await asyncio.sleep(60)
+                    elif "rateLimit" in graph_data:
+                        # GitHub returned HTTP 200 but rateLimit was explicitly
+                        # null - a degraded-server partial response (often seen
+                        # alongside 502s). Not fatal: skip the rate-limit read
+                        # this round, the "errors" branch below will still
+                        # correctly process whatever repo data did come back.
+                        print(f"[{ts()} {token_label}] rateLimit was null in response (likely degraded server), skipping rate check this round")
 
                     if "errors" in data:
                         batch_not_found = 0
